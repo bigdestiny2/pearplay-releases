@@ -1,0 +1,153 @@
+name: Windows preview native startup
+
+on:
+  workflow_dispatch:
+
+# Public release download only: no checkout, credentials, or dependency actions.
+permissions: {}
+
+jobs:
+  native-startup:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify exact preview and run native startup smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $asset = 'PearPlay-0.2.0-preview.20260905-windows-x64.zip'
+          $expectedSha256 = '02f1bc2cbcd88da33176c3c0f5ba887c20af4e71bcbba30dd7ddb259b02f21ef'
+          $url = "https://github.com/bigdestiny2/pearplay-releases/releases/download/v0.2.0-preview.20260905/$asset"
+          $workRoot = Join-Path $env:RUNNER_TEMP ("pearplay-preview-qa-" + [guid]::NewGuid().ToString('N'))
+          $profile = Join-Path $workRoot 'profile'
+          $expanded = Join-Path $workRoot 'expanded'
+          $archive = Join-Path $workRoot $asset
+          $process = $null
+          $outputTask = $null
+          $errorTask = $null
+          $failure = $null
+          $exitCode = $null
+          $stdoutText = ''
+          $stderrText = ''
+          $hashVerified = $false
+          $markerObserved = $false
+          $noRemainingRuntime = $false
+          $elapsed = [System.Diagnostics.Stopwatch]::new()
+          try {
+            New-Item -ItemType Directory -Path $profile, $expanded -Force | Out-Null
+            Invoke-WebRequest -Uri $url -OutFile $archive -MaximumRetryCount 3 -RetryIntervalSec 2
+            $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualSha256 -cne $expectedSha256) {
+              throw "Archive SHA-256 mismatch. Expected $expectedSha256; received $actualSha256. Nothing was executed."
+            }
+            $hashVerified = $true
+            Expand-Archive -LiteralPath $archive -DestinationPath $expanded
+            $packageRoot = Join-Path $expanded 'PearPlay-0.2.0-preview.20260905-windows-x64'
+            $executable = Join-Path $packageRoot 'PearPlay/PearPlay.exe'
+            $manifest = Get-Content -LiteralPath (Join-Path $packageRoot 'native-package.json') -Raw | ConvertFrom-Json
+            if ($manifest.target -cne 'win32-x64' -or $manifest.executable -cne 'PearPlay/PearPlay.exe') {
+              throw 'Unexpected native target or entry point in the hash-verified package.'
+            }
+            if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+              throw 'The native PearPlay.exe entry point is missing.'
+            }
+
+            $start = [System.Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = $executable
+            $start.WorkingDirectory = $profile
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $start.ArgumentList.Add("--user-data-dir=$(Join-Path $profile 'electron')")
+            $start.Environment['PEARPLAY_DESKTOP_SMOKE'] = '1'
+            $start.Environment['HOME'] = $profile
+            $start.Environment['USERPROFILE'] = $profile
+            $start.Environment['APPDATA'] = Join-Path $profile 'AppData/Roaming'
+            $start.Environment['LOCALAPPDATA'] = Join-Path $profile 'AppData/Local'
+            New-Item -ItemType Directory -Path $start.Environment['APPDATA'], $start.Environment['LOCALAPPDATA'] -Force | Out-Null
+            foreach ($name in @('ELECTRON_RUN_AS_NODE', 'NODE_OPTIONS', 'NODE_PATH', 'PEARPLAY_PAIR_TOKEN', 'PEARPLAY_CONTROL_TOKEN', 'PEARPLAY_READY_FD', 'PEARPLAY_LOBBY')) {
+              $null = $start.Environment.Remove($name)
+            }
+            $process = [System.Diagnostics.Process]::new()
+            $process.StartInfo = $start
+            $elapsed.Start()
+            if (-not $process.Start()) { throw 'Windows did not start PearPlay.exe.' }
+            # Drain both redirected streams concurrently so a diagnostic burst
+            # cannot deadlock the process while the bounded exit wait runs.
+            $outputTask = $process.StandardOutput.ReadToEndAsync()
+            $errorTask = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(45000)) {
+              $process.Kill($true)
+              $null = $process.WaitForExit(5000)
+              throw 'Native startup/shutdown exceeded the 45-second deadline.'
+            }
+            $exitCode = $process.ExitCode
+            if (-not $outputTask.Wait(5000) -or -not $errorTask.Wait(5000)) {
+              throw 'Native process exited but an inherited output stream remained open.'
+            }
+            $stdoutText = $outputTask.Result
+            $stderrText = $errorTask.Result
+            $markerObserved = @($stdoutText -split '\r?\n') -ccontains 'PearPlay: packaged desktop startup smoke passed'
+            if ($exitCode -ne 0) { throw "Native PearPlay.exe exited with code $exitCode." }
+            if (-not $markerObserved) { throw 'Exit zero without the exact authenticated-startup success marker is not a pass.' }
+            $remaining = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $executable })
+            if ($remaining.Count -ne 0) {
+              foreach ($entry in $remaining) { Stop-Process -Id $entry.ProcessId -Force -ErrorAction SilentlyContinue }
+              throw 'A PearPlay native engine/runtime process remained after the shell exited.'
+            }
+            $noRemainingRuntime = $true
+          } catch {
+            $failure = $_.Exception.Message
+          } finally {
+            $elapsed.Stop()
+            if ($null -ne $process) {
+              try {
+                if (-not $process.HasExited) {
+                  $process.Kill($true)
+                  $null = $process.WaitForExit(5000)
+                }
+              } catch {}
+            }
+            if ($null -ne $outputTask -and $outputTask.IsCompletedSuccessfully) { $stdoutText = $outputTask.Result }
+            if ($null -ne $errorTask -and $errorTask.IsCompletedSuccessfully) { $stderrText = $errorTask.Result }
+            Write-Host '--- native stdout ---'
+            Write-Host $stdoutText
+            Write-Host '--- native stderr ---'
+            Write-Host $stderrText
+            $passed = $null -eq $failure
+            $evidence = [ordered]@{
+              schemaVersion = 1
+              asset = $asset
+              expectedSha256 = $expectedSha256
+              archiveHashVerified = $hashVerified
+              target = 'win32-x64'
+              runnerImage = $env:ImageOS
+              runnerImageVersion = $env:ImageVersion
+              checkedAt = [DateTime]::UtcNow.ToString('o')
+              elapsedMilliseconds = $elapsed.ElapsedMilliseconds
+              nativeExitCode = $exitCode
+              authenticatedEngineMarkerObserved = $markerObserved
+              noRemainingNativeRuntime = $noRemainingRuntime
+              nativeStartupAndShutdownPassed = $passed
+              uiTested = $false
+              downloadedFileTrustBehaviorTested = $false
+              productionQualified = $false
+              failure = $failure
+            }
+            $evidenceJson = $evidence | ConvertTo-Json -Depth 5
+            Write-Host $evidenceJson
+            $heading = if ($passed) { 'PASS: exact Windows preview native startup' } else { 'FAIL: Windows preview native startup' }
+            @(
+              "## $heading"
+              ''
+              'This checks the exact public ZIP on Windows: the real native shell, child engine private readiness, authenticated /auth/status, exit zero, and engine shutdown. It does not open a BrowserWindow or test UI, games, installer behavior, SmartScreen, signing, or multiplayer.'
+              ''
+              '```json'
+              $evidenceJson
+              '```'
+            ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+            if ($null -ne $process) { $process.Dispose() }
+            Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if ($null -ne $failure) { throw $failure }
