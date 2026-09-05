@@ -1,24 +1,27 @@
-name: Windows preview native startup
+name: Windows r2 native startup and profile ownership
 
 on:
   workflow_dispatch:
 
-# Public release download only: no checkout, credentials, or dependency actions.
-permissions: {}
+# Read one draft release; no checkout or dependency actions.
+permissions:
+  contents: read
 
 jobs:
   native-startup:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - name: Verify exact preview and run native startup smoke
+      - name: Verify draft r2 and run native startup smoke
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
-          $asset = 'PearPlay-0.2.0-preview.20260905-windows-x64.zip'
-          $expectedSha256 = '02f1bc2cbcd88da33176c3c0f5ba887c20af4e71bcbba30dd7ddb259b02f21ef'
-          $url = "https://github.com/bigdestiny2/pearplay-releases/releases/download/v0.2.0-preview.20260905/$asset"
+          $asset = 'PearPlay-0.2.0-preview.20260905-windows-x64-r2.zip'
+          $expectedSha256 = 'a14b6b140956a3cd427850e1e2a62e1b7237479e0deda2d8061842dc5efd8bae'
+          $draftTag = 'v0.2.0-preview.20260905-windows-r2'
           $workRoot = Join-Path $env:RUNNER_TEMP ("pearplay-preview-qa-" + [guid]::NewGuid().ToString('N'))
           $profile = Join-Path $workRoot 'profile'
           $expanded = Join-Path $workRoot 'expanded'
@@ -33,17 +36,21 @@ jobs:
           $hashVerified = $false
           $markerObserved = $false
           $noRemainingRuntime = $false
+          $profileLeaseRegressionPassed = $false
           $elapsed = [System.Diagnostics.Stopwatch]::new()
           try {
             New-Item -ItemType Directory -Path $profile, $expanded -Force | Out-Null
-            Invoke-WebRequest -Uri $url -OutFile $archive -MaximumRetryCount 3 -RetryIntervalSec 2
+            & gh release download $draftTag --repo bigdestiny2/pearplay-releases --pattern $asset --dir $workRoot
+            if ($LASTEXITCODE -ne 0) { throw 'Draft release download failed.' }
+            # Do not expose the draft-read token to executable package code.
+            $env:GH_TOKEN = $null
             $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($actualSha256 -cne $expectedSha256) {
               throw "Archive SHA-256 mismatch. Expected $expectedSha256; received $actualSha256. Nothing was executed."
             }
             $hashVerified = $true
             Expand-Archive -LiteralPath $archive -DestinationPath $expanded
-            $packageRoot = Join-Path $expanded 'PearPlay-0.2.0-preview.20260905-windows-x64'
+            $packageRoot = Join-Path $expanded 'PearPlay-0.2.0-preview.20260905-windows-x64-r2'
             $executable = Join-Path $packageRoot 'PearPlay/PearPlay.exe'
             $manifest = Get-Content -LiteralPath (Join-Path $packageRoot 'native-package.json') -Raw | ConvertFrom-Json
             if ($manifest.target -cne 'win32-x64' -or $manifest.executable -cne 'PearPlay/PearPlay.exe') {
@@ -66,9 +73,128 @@ jobs:
             $start.Environment['APPDATA'] = Join-Path $profile 'AppData/Roaming'
             $start.Environment['LOCALAPPDATA'] = Join-Path $profile 'AppData/Local'
             New-Item -ItemType Directory -Path $start.Environment['APPDATA'], $start.Environment['LOCALAPPDATA'] -Force | Out-Null
-            foreach ($name in @('ELECTRON_RUN_AS_NODE', 'NODE_OPTIONS', 'NODE_PATH', 'PEARPLAY_PAIR_TOKEN', 'PEARPLAY_CONTROL_TOKEN', 'PEARPLAY_READY_FD', 'PEARPLAY_LOBBY')) {
+            foreach ($name in @('ELECTRON_RUN_AS_NODE', 'NODE_OPTIONS', 'NODE_PATH', 'PEARPLAY_PAIR_TOKEN', 'PEARPLAY_CONTROL_TOKEN', 'PEARPLAY_READY_FD', 'PEARPLAY_LOBBY', 'GH_TOKEN', 'GITHUB_TOKEN')) {
               $null = $start.Environment.Remove($name)
             }
+          $probePath = Join-Path $workRoot 'profile-lease-probe.mjs'
+          $probeSource = @'
+          import { spawn } from 'node:child_process'
+          import { once } from 'node:events'
+          import { randomBytes } from 'node:crypto'
+          import { join } from 'node:path'
+          import { setTimeout as delay } from 'node:timers/promises'
+          
+          const [payload, profile] = process.argv.slice(2)
+          const instances = []
+          const isAlive = child => child.exitCode === null && child.signalCode === null
+          async function startEngine () {
+            const control = randomBytes(32).toString('hex')
+            const child = spawn(process.execPath, [join(payload, 'scripts/launch.js')], {
+              cwd: profile,
+              env: { ...process.env, HOME: profile, USERPROFILE: profile, HOST: '127.0.0.1', PORT: '0',
+                ELECTRON_RUN_AS_NODE: '1', PEARPLAY_READY_FD: '', PEARPLAY_CONTROL_TOKEN: control,
+                PEARPLAY_PAIR_TOKEN: randomBytes(32).toString('hex'), PEARPLAY_NET: 'swarm' },
+              stdio: ['ignore', 'pipe', 'pipe']
+            })
+            let output = ''
+            child.stdout.on('data', data => { output = (output + data).slice(-10000) })
+            child.stderr.on('data', data => { output = (output + data).slice(-10000) })
+            const closed = once(child, 'close')
+            const instance = { child, closed, control, output: () => output }
+            instances.push(instance)
+            return instance
+          }
+          async function ready (instance) {
+            for (let attempt = 0; attempt < 100; attempt++) {
+              const match = instance.output().match(/PEARPLAY cabinet\s+(http:\/\/127\.0\.0\.1:\d+)/)
+              if (match) {
+                const response = await fetch(match[1] + '/auth/status', {
+                  headers: { 'x-pearplay-control': instance.control }, signal: AbortSignal.timeout(2000)
+                })
+                if (response.status === 200) return match[1]
+              }
+              if (!isAlive(instance.child)) throw new Error('Engine exited before authentication:\n' + instance.output())
+              await delay(100)
+            }
+            throw new Error('Engine startup deadline exceeded:\n' + instance.output())
+          }
+          async function stopped (instance, timeoutMs = 5000) {
+            let watchdog
+            try {
+              return await Promise.race([instance.closed, new Promise((resolve, reject) => {
+                watchdog = setTimeout(() => reject(new Error('Engine did not exit within its deadline')), timeoutMs)
+              })])
+            } finally { clearTimeout(watchdog) }
+          }
+          try {
+            const owner = await startEngine()
+            const origin = await ready(owner)
+            // The packaged launcher writes its ownership heartbeat every five seconds.
+            // Survive two updates through the held Windows file descriptor.
+            await delay(11000)
+            if (!isAlive(owner.child)) throw new Error('Owner died during heartbeat updates:\n' + owner.output())
+            const status = await fetch(origin + '/auth/status', {
+              headers: { 'x-pearplay-control': owner.control }, signal: AbortSignal.timeout(2000)
+            })
+            if (status.status !== 200) throw new Error('Owner lost its authenticated listener after heartbeats')
+            const contender = await startEngine()
+            const [code] = await stopped(contender)
+            if (code !== 1 || !contender.output().includes('PearPlay profile is already active')) {
+              throw new Error('Same-profile contender was not refused by the kernel ownership guard:\n' + contender.output())
+            }
+            if (!isAlive(owner.child)) throw new Error('Contender disrupted the existing owner')
+            owner.child.kill('SIGKILL')
+            await stopped(owner)
+            const recovered = await startEngine()
+            await ready(recovered)
+            recovered.child.kill('SIGKILL')
+            await stopped(recovered)
+            console.log('PearPlay: Windows profile heartbeat, live-owner rejection, and crash reacquisition passed')
+          } catch (error) {
+            console.error(error.message)
+            process.exitCode = 1
+          } finally {
+            for (const instance of instances) {
+              if (isAlive(instance.child)) instance.child.kill('SIGKILL')
+            }
+          }
+          '@
+          Set-Content -LiteralPath $probePath -Value $probeSource -Encoding utf8
+          $probeStart = [System.Diagnostics.ProcessStartInfo]::new()
+          $probeStart.FileName = $executable
+          $probeStart.WorkingDirectory = $profile
+          $probeStart.UseShellExecute = $false
+          $probeStart.RedirectStandardOutput = $true
+          $probeStart.RedirectStandardError = $true
+          $probeStart.ArgumentList.Add($probePath)
+          $probeStart.ArgumentList.Add((Join-Path $packageRoot 'PearPlay/resources/pearplay'))
+          $probeStart.ArgumentList.Add($profile)
+          foreach ($entry in $start.Environment.GetEnumerator()) { $probeStart.Environment[$entry.Key] = $entry.Value }
+          $probeStart.Environment['ELECTRON_RUN_AS_NODE'] = '1'
+          $null = $probeStart.Environment.Remove('PEARPLAY_DESKTOP_SMOKE')
+          $probeProcess = [System.Diagnostics.Process]::new()
+          $probeProcess.StartInfo = $probeStart
+          try {
+            if (-not $probeProcess.Start()) { throw 'Windows did not start the profile ownership probe.' }
+            $probeOutputTask = $probeProcess.StandardOutput.ReadToEndAsync()
+            $probeErrorTask = $probeProcess.StandardError.ReadToEndAsync()
+            if (-not $probeProcess.WaitForExit(45000)) {
+              $probeProcess.Kill($true)
+              $null = $probeProcess.WaitForExit(5000)
+              throw 'Windows profile ownership regression probe exceeded its deadline.'
+            }
+            if (-not $probeOutputTask.Wait(5000) -or -not $probeErrorTask.Wait(5000)) { throw 'Profile regression probe output did not close.' }
+            Write-Host $probeOutputTask.Result
+            Write-Host $probeErrorTask.Result
+            if ($probeProcess.ExitCode -ne 0) { throw 'Windows profile ownership regression probe failed.' }
+            if (-not (@($probeOutputTask.Result -split '\r?\n') -ccontains 'PearPlay: Windows profile heartbeat, live-owner rejection, and crash reacquisition passed')) {
+              throw 'Profile regression probe did not report its exact success marker.'
+            }
+            $profileLeaseRegressionPassed = $true
+          } finally {
+            try { if (-not $probeProcess.HasExited) { $probeProcess.Kill($true) } } catch {}
+            $probeProcess.Dispose()
+          }
             $process = [System.Diagnostics.Process]::new()
             $process.StartInfo = $start
             $elapsed.Start()
@@ -130,6 +256,7 @@ jobs:
               authenticatedEngineMarkerObserved = $markerObserved
               noRemainingNativeRuntime = $noRemainingRuntime
               nativeStartupAndShutdownPassed = $passed
+              profileHeartbeatContentionAndRecoveryPassed = $profileLeaseRegressionPassed
               uiTested = $false
               downloadedFileTrustBehaviorTested = $false
               productionQualified = $false
@@ -141,7 +268,7 @@ jobs:
             @(
               "## $heading"
               ''
-              'This checks the exact public ZIP on Windows: the real native shell, child engine private readiness, authenticated /auth/status, exit zero, and engine shutdown. It does not open a BrowserWindow or test UI, games, installer behavior, SmartScreen, signing, or multiplayer.'
+              'This checks the exact public ZIP on Windows: live ownership heartbeat updates, same-profile contention rejection, crash reacquisition, then the real native shell, child engine private readiness, authenticated /auth/status, exit zero, and engine shutdown. It does not open a BrowserWindow or test UI, games, installer behavior, SmartScreen, signing, or multiplayer.'
               ''
               '```json'
               $evidenceJson
