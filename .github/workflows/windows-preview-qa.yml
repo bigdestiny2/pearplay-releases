@@ -3,7 +3,7 @@ name: Windows r2 native startup and profile ownership
 on:
   workflow_dispatch:
 
-# Download one checksum-pinned candidate through a temporary artifact-only URL.
+# Download one checksum-pinned public preview without credentials.
 # This job has no repository write or read capability.
 permissions: {}
 
@@ -12,16 +12,14 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - name: Verify draft r2 and run native startup smoke
-        env:
-          PEARPLAY_PREVIEW_DOWNLOAD_URL: ${{ secrets.PEARPLAY_PREVIEW_DOWNLOAD_URL }}
+      - name: Verify public r2 and run native startup smoke
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
           $asset = 'PearPlay-0.2.0-preview.20260905-windows-x64-r2.zip'
           $expectedSha256 = 'a14b6b140956a3cd427850e1e2a62e1b7237479e0deda2d8061842dc5efd8bae'
-          $downloadUrl = $env:PEARPLAY_PREVIEW_DOWNLOAD_URL
+          $downloadUrl = 'https://github.com/bigdestiny2/pearplay-releases/releases/download/v0.2.0-preview.20260905-windows-r2/PearPlay-0.2.0-preview.20260905-windows-x64-r2.zip'
           $workRoot = Join-Path $env:RUNNER_TEMP ("pearplay-preview-qa-" + [guid]::NewGuid().ToString('N'))
           $profile = Join-Path $workRoot 'profile'
           $expanded = Join-Path $workRoot 'expanded'
@@ -40,30 +38,7 @@ jobs:
           $elapsed = [System.Diagnostics.Stopwatch]::new()
           try {
             New-Item -ItemType Directory -Path $profile, $expanded -Force | Out-Null
-            if ([string]::IsNullOrWhiteSpace($downloadUrl) -or $downloadUrl.Length -gt 16384 -or $downloadUrl -match '[\x00-\x20\x7f]') {
-              throw 'The temporary preview download URL is missing or malformed.'
-            }
-            # GitHub masks the repository secret automatically. Mask the exact
-            # value and its normalized URI too, and never print download errors
-            # that might contain query-string credentials.
-            Write-Host "::add-mask::$downloadUrl"
-            $downloadUri = $null
-            if (-not [Uri]::TryCreate($downloadUrl, [UriKind]::Absolute, [ref]$downloadUri)) {
-              throw 'The temporary preview download URL is invalid.'
-            }
-            if ($downloadUri.Scheme -cne 'https' -or $downloadUri.DnsSafeHost -cne 'release-assets.githubusercontent.com' -or $downloadUri.Port -ne 443 -or $downloadUri.UserInfo -ne '' -or $downloadUri.Fragment -ne '') {
-              throw 'The preview URL must use the approved HTTPS release-asset host without user info or fragment.'
-            }
-            Write-Host "::add-mask::$($downloadUri.AbsoluteUri)"
-            try {
-              Invoke-WebRequest -Uri $downloadUri -OutFile $archive -MaximumRedirection 0 -TimeoutSec 180
-            } catch {
-              throw 'Temporary preview download failed. The artifact-only URL may have expired; no package code was executed.'
-            }
-            # The temporary asset credential never reaches executable code.
-            $env:PEARPLAY_PREVIEW_DOWNLOAD_URL = $null
-            $downloadUrl = $null
-            $downloadUri = $null
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $archive -MaximumRedirection 5 -TimeoutSec 180
             $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($actualSha256 -cne $expectedSha256) {
               throw "Archive SHA-256 mismatch. Expected $expectedSha256; received $actualSha256. Nothing was executed."
@@ -93,7 +68,7 @@ jobs:
             $start.Environment['APPDATA'] = Join-Path $profile 'AppData/Roaming'
             $start.Environment['LOCALAPPDATA'] = Join-Path $profile 'AppData/Local'
             New-Item -ItemType Directory -Path $start.Environment['APPDATA'], $start.Environment['LOCALAPPDATA'] -Force | Out-Null
-            foreach ($name in @('ELECTRON_RUN_AS_NODE', 'NODE_OPTIONS', 'NODE_PATH', 'PEARPLAY_PAIR_TOKEN', 'PEARPLAY_CONTROL_TOKEN', 'PEARPLAY_READY_FD', 'PEARPLAY_LOBBY', 'PEARPLAY_PREVIEW_DOWNLOAD_URL')) {
+            foreach ($name in @('ELECTRON_RUN_AS_NODE', 'NODE_OPTIONS', 'NODE_PATH', 'PEARPLAY_PAIR_TOKEN', 'PEARPLAY_CONTROL_TOKEN', 'PEARPLAY_READY_FD', 'PEARPLAY_LOBBY')) {
               $null = $start.Environment.Remove($name)
             }
           $probePath = Join-Path $workRoot 'profile-lease-probe.mjs'
@@ -246,7 +221,6 @@ jobs:
           } catch {
             $failure = $_.Exception.Message
           } finally {
-            $env:PEARPLAY_PREVIEW_DOWNLOAD_URL = $null
             $elapsed.Stop()
             if ($null -ne $process) {
               try {
